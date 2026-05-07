@@ -1,0 +1,72 @@
+# .github/workflows/security.yml
+#
+# Security CI pipeline
+# Addresses:
+#   F-08  pip-audit scans for known CVEs in pinned dependencies on every push
+#   F-11  gitleaks scans commit history for accidentally committed secrets
+#   F-16  GitHub secret scanning (native) is enabled via the UI; this workflow
+#         adds a gitleaks scan as a belt-and-suspenders check in CI
+#
+# Runs on every push and pull request to main.
+
+name: Security Checks
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  dependency-audit:
+    name: Dependency CVE Audit (F-08)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pinned dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --strict
+
+  secret-scan:
+    name: Secret / Credential Scan (F-11, F-16)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history required for gitleaks
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  lint:
+    name: Python Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Run flake8
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics \
+            --exclude=.venv,output,logs

@@ -1,0 +1,22 @@
+# Rubrik CDM Pre-Upgrade Assessment — Pinned Dependencies
+# F-08: All packages pinned to specific versions to prevent supply-chain attacks.
+#
+# To update:
+#   1. Edit version constraints below
+#   2. Run: pip install -r requirements.txt
+#   3. Run: pip freeze > requirements-lock.txt  (commit both files)
+#   4. Run: pip-audit -r requirements.txt       (check for known CVEs)
+#
+# Install: pip install -r requirements.txt
+
+# HTTP requests (CDM + RSC API calls)
+requests==2.32.3
+
+# Environment variable management (.env file loading)
+python-dotenv==1.0.1
+
+# TLS/HTTP library (bundled with requests, pinned for supply-chain safety)
+urllib3==2.2.3
+
+# Optional: security audit tool (install separately in CI)
+# pip-audit>=2.7.0
