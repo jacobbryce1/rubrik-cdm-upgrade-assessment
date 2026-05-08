@@ -1,72 +1,151 @@
-# .github/workflows/security.yml
-#
-# Security CI pipeline
-# Addresses:
-#   F-08  pip-audit scans for known CVEs in pinned dependencies on every push
-#   F-11  gitleaks scans commit history for accidentally committed secrets
-#   F-16  GitHub secret scanning (native) is enabled via the UI; this workflow
-#         adds a gitleaks scan as a belt-and-suspenders check in CI
-#
-# Runs on every push and pull request to main.
+# Security Policy
 
-name: Security Checks
+## Supported Versions
 
-on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+| Version | Supported |
+|---------|-----------|
+| 1.x     | ✅ Yes    |
 
-jobs:
-  dependency-audit:
-    name: Dependency CVE Audit (F-08)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+---
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+## Reporting a Vulnerability
 
-      - name: Install pinned dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+**Please do NOT open a public GitHub issue for security vulnerabilities.**
 
-      - name: Run pip-audit
-        run: |
-          pip install pip-audit
-          pip-audit -r requirements.txt --strict
+This tool handles RSC service account credentials and CDM cluster credentials, and produces detailed assessment reports of your Rubrik estate — including cluster names, node IP addresses, version strings, storage capacity, SLA policies, workload inventory, and replication topology. Responsible disclosure is important.
 
-  secret-scan:
-    name: Secret / Credential Scan (F-11, F-16)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # full history required for gitleaks
+### How to Report
 
-      - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+Use **GitHub's private vulnerability reporting**:
 
-  lint:
-    name: Python Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+1. Go to the [Security tab](../../security) of this repository
+2. Click **"Report a vulnerability"**
+3. Fill in the details — include steps to reproduce, impact assessment, and any suggested remediation if you have one
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+We aim to acknowledge reports within **3 business days** and provide a fix or mitigation within **14 days** for high/critical issues.
 
-      - name: Install flake8
-        run: pip install flake8
+### What to Include
 
-      - name: Run flake8
-        run: |
-          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics \
-            --exclude=.venv,output,logs
+- A description of the vulnerability and its potential impact
+- Steps to reproduce (proof-of-concept code if applicable)
+- The version(s) affected
+- Any suggested fix
+
+### Out of Scope
+
+- Vulnerabilities in Rubrik Security Cloud (RSC) itself — report those directly to Rubrik
+- Vulnerabilities in CDM software — report those directly to Rubrik
+- Denial-of-service against the local Python process
+- Issues that require physical access to the machine running the assessment
+- Rate-limit overages caused by misconfigured parallelism settings
+- Assessment inaccuracies caused by stale `cdm_eos_data.json` or `compatibility_matrix.py` data
+
+---
+
+## Security Design
+
+### Credential Handling
+
+- All credentials (`RSC_CLIENT_ID`, `RSC_CLIENT_SECRET`, `RSC_BASE_URL`, `RSC_ACCESS_TOKEN_URI`) are loaded exclusively from environment variables or a `.env` file — never hardcoded in source.
+- Credentials are immediately wrapped in a `SecretStr` type on load in `config.py`. `SecretStr` values never appear in `repr()`, `str()`, log output, or exception tracebacks — they render as `**********` in any context that would otherwise expose them.
+- `RSC_CLIENT_SECRET.get_secret_value()` is called only at the exact point of HTTP transmission in `rsc_client.py`. The wrapped object is passed through all other layers — thread pools, collector modules, enrichment functions — without ever unwrapping it.
+- CDM direct API credentials are obtained per-cluster via the RSC API and are also wrapped as `SecretStr` for their lifetime. They are never written to disk, logged, or included in report output.
+- Use a **dedicated read-only service account** scoped to `ViewCluster`, `ViewSLA`, and `ViewInventory`. Rotate the secret after each assessment run to limit blast radius if the `.env` file is ever exposed.
+
+### Token Lifecycle
+
+- RSC token acquisition and refresh are handled in `rsc_client.py`. The active token is stored as a `SecretStr` and never logged or surfaced in output.
+- Tokens are proactively refreshed `TOKEN_REFRESH_BUFFER_SEC` seconds before expiry (default: 300 seconds), preventing mid-run failures on long multi-cluster assessments.
+- Token refresh is thread-safe — a single lock prevents concurrent collector threads from triggering redundant refresh calls under parallel execution.
+- On receipt of a 401 or 403 response, the token is force-refreshed and the request retried before surfacing an error.
+- SSL errors during authentication are never retried — they raise immediately with a clear message, preventing silent MITM exposure.
+
+### Network Security — RSC API
+
+- TLS certificate verification is explicitly enforced on all RSC API calls in `rsc_client.py`. There is no mechanism to disable this for RSC communication.
+- `SSLError` on RSC calls is caught and raised as a fatal error — it is never absorbed by the generic retry loop and never silently bypassed.
+- All RSC API communication is HTTPS only. There is no HTTP fallback.
+- `urllib3.disable_warnings()` has been removed entirely — TLS warnings are never globally suppressed anywhere in the codebase.
+
+### Network Security — CDM Direct API
+
+- CDM direct API calls default to `CDM_CA_BUNDLE=true` (system CAs). This is the only safe default for production use.
+- A custom CA bundle path (`CDM_CA_BUNDLE=/path/to/bundle.pem`) is supported for environments where CDM clusters use internally-signed certificates.
+- `CDM_CA_BUNDLE=false` disables TLS verification for CDM direct calls. This setting is provided for isolated lab environments only. When set, a warning is emitted on every API call — it cannot be silenced. Do not use this setting in any environment where the network path to CDM nodes is untrusted.
+- `MAX_CDM_AUTH_ATTEMPTS` limits the number of node IPs tried per cluster during CDM authentication, preventing credential spray across large node pools on transient failures.
+
+### Output File Security
+
+- The `output/` and `logs/` directories are created with `chmod 0700` (owner-only access) before any files are written.
+- Each output file — JSON report, CSV, HTML dashboard, JSONL stream files, and the integrity manifest — is created with `chmod 0600` (owner read/write only) at the file descriptor level using `os.open()` with `O_CREAT`, before any data is written. This closes the race window that would exist with a post-write `chmod`.
+- Output files contain sensitive infrastructure data: cluster names, node IP addresses, CDM version strings, SLA policies, storage capacity figures, workload inventory, replication topology, and detailed upgrade blocker information. Treat them with the same sensitivity as network diagrams or infrastructure inventories.
+- The `logs/` directory contains full debug output including API response structures, cluster metadata, and collector timing. Treat log files with the same sensitivity as report output.
+
+### SHA-256 Integrity Manifest
+
+- A `manifest.sha256` file is written at the end of every assessment run, containing SHA-256 hashes of all output files.
+- The manifest allows downstream consumers — change management processes, audit teams, or automated tooling — to verify that report files have not been modified after the assessment completed.
+- Verify before making upgrade decisions:
+
+```bash
+cd output/assessment_YYYYMMDD_HHMMSS/
+sha256sum -c manifest.sha256
+```
+
+- Any file reporting other than `OK` indicates post-assessment modification. Do not act on a result set that fails integrity verification.
+
+### Credential Leak Prevention
+
+- `.gitignore` excludes `.env`, `output/`, and `logs/` from version control.
+- `setup.sh` offers to install a `detect-secrets` pre-commit hook on supported systems, which scans staged files for credential patterns before they reach Git history.
+- A GitHub Actions workflow (`.github/workflows/security.yml`) runs `gitleaks` across the full commit history on every push and pull request, detecting any credentials that may have been accidentally committed.
+
+### Error Handling and Information Leakage
+
+- Raw API response bodies are never written to stdout. The logging layer in `rsc_client.py` captures structured fields only — status codes and message strings bounded in length — not full response payloads.
+- Exception strings from `requests` (which may contain full URLs, headers, or partial response bodies) are never propagated to user-visible console output or report content.
+- Per-collector error isolation in `main.py` ensures that a failure in one collector (e.g., `cdm_live_mounts`) does not surface internal stack traces in the HTML report. The cluster is marked `PARTIAL` and the specific collector failure is recorded in the log file only.
+- The `run_id` embedded in every log line and log filename allows cross-thread correlation in parallel runs without exposing cluster credentials or API tokens in the log stream.
+
+### Dependency Management
+
+- All dependencies are pinned to exact versions in `requirements.txt`, preventing silent supply-chain upgrades to vulnerable versions.
+- A GitHub Actions workflow runs `pip-audit` automatically on every push to detect known CVEs in pinned dependencies.
+- Run a local audit at any time:
+
+```bash
+pip install pip-audit
+pip-audit -r requirements.txt
+```
+
+---
+
+## Files Generated at Runtime
+
+| File | Contents | Protected by |
+|------|----------|--------------|
+| `.env` | RSC credentials, target version | `.gitignore`, OS file permissions |
+| `output/` | Assessment reports (all formats) | `.gitignore`, `chmod 0700` / `0600` |
+| `output/manifest.sha256` | SHA-256 hashes of all output files | `chmod 0600` |
+| `logs/` | Rotating debug log files | `.gitignore`, `chmod 0700` |
+
+> The `output/` directory contains cluster names, node IPs, version strings, SLA policies, workload inventory, and replication topology. The `logs/` directory may contain API response structures and cluster metadata at `DEBUG` log level. Both must be treated as sensitive infrastructure data and must not be stored on shared or world-readable filesystems.
+
+---
+
+## Threat Model
+
+This tool is designed for **single-operator or small-team use on a trusted host** — an Advisory SE or infrastructure engineer running the assessment on a local workstation or a secure jump host with network access to both RSC and CDM node IPs. The threat model assumes:
+
+- **The host is trusted.** The tool does not defend against a compromised OS or a malicious local user with access to the working directory, `.env` file, or output files. OS-level user separation and filesystem permissions (`chmod 0700`/`0600`) are the primary controls for data at rest.
+- **The RSC instance is trusted.** The tool validates `RSC_BASE_URL` format at startup but does not defend against a compromised RSC instance returning malicious cluster data. HTML report generation treats all field values as untrusted strings — they are written through an escaping layer — but downstream consumers of CSV and JSON output should treat all field values as untrusted data in any further processing.
+- **The network path to RSC is trusted.** TLS verification is enforced and cannot be disabled for RSC calls, but the tool does not implement certificate pinning. A compromised CA in the system trust store could perform MITM undetected.
+- **The network path to CDM nodes may use internal CAs.** `CDM_CA_BUNDLE` supports custom CA bundles for this case. `CDM_CA_BUNDLE=false` is explicitly out of scope for production threat modelling — it should only be used in air-gapped lab environments where the network is fully controlled.
+- **The `.env` file is protected by the OS.** `SecretStr` wrapping and `.gitignore` are code-level controls that reduce accidental exposure — they do not replace OS file permissions or secrets management. For production or team deployments, consider a secrets manager (HashiCorp Vault, AWS Secrets Manager, Azure Key Vault) rather than a `.env` file.
+- **Assessment output is point-in-time.** Reports reflect cluster state at the time of the run. The integrity manifest detects post-run tampering but does not prevent a stale report from being used to justify an upgrade decision. Always re-run the assessment close to the planned upgrade window.
+
+---
+
+## Security Contact
+
+For questions about the security design of this tool, open a GitHub Discussion rather than a private report.
